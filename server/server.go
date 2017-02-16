@@ -4,209 +4,217 @@
 package server
 
 import (
-	"fmt"
-	"log"
-	"net"
-	"net/http"
-	"strings"
+    "fmt"
+    "log"
+    "net"
+    "net/http"
+    "strings"
 
-	"github.com/alexjlockwood/gcm"
-	"github.com/braintree/manners"
-	"github.com/gorilla/mux"
-	"github.com/kyokomi/emoji"
-	apns "github.com/sideshow/apns2"
-	"github.com/sideshow/apns2/certificate"
-	"github.com/sideshow/apns2/payload"
-	"gopkg.in/throttled/throttled.v1"
-	throttledStore "gopkg.in/throttled/throttled.v1/store"
+    "github.com/alexjlockwood/gcm"
+    "github.com/braintree/manners"
+    "github.com/gorilla/mux"
+    "github.com/kyokomi/emoji"
+    apns "github.com/sideshow/apns2"
+    "github.com/sideshow/apns2/certificate"
+    "github.com/sideshow/apns2/payload"
+    "gopkg.in/throttled/throttled.v1"
+    throttledStore "gopkg.in/throttled/throttled.v1/store"
+    "os"
+    "net/url"
 )
 
 const (
-	HEADER_FORWARDED = "X-Forwarded-For"
-	HEADER_REAL_IP   = "X-Real-IP"
+    HEADER_FORWARDED = "X-Forwarded-For"
+    HEADER_REAL_IP   = "X-Real-IP"
 )
 
 var appleClient *apns.Client
 
 func Start() {
-	LogInfo("Push proxy server is initializing...")
+    LogInfo("Push proxy server is initializing...")
 
-	if len(CfgPP.ApplePushCertPrivate) > 0 {
-		appleCert, appleCertErr := certificate.FromPemFile(CfgPP.ApplePushCertPrivate, CfgPP.ApplePushCertPassword)
-		if appleCertErr != nil {
-			LogCritical(fmt.Sprintf("Failed to load the apple pem cert err=%v", appleCertErr))
-		}
+    http_proxy := os.Getenv("HTTP_PROXY")
+    if http_proxy != "" {
+        proxyUrl, err := url.Parse(http_proxy)
+        if err != nil {
+            http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+        }
+    }
 
-		if CfgPP.ApplePushUseDevelopment {
-			appleClient = apns.NewClient(appleCert).Development()
-		} else {
-			appleClient = apns.NewClient(appleCert).Production()
-		}
-	} else {
-		LogError("Apple push notifications not configured.  Mssing ApplePushCertPrivate.")
-	}
+    if len(CfgPP.ApplePushCertPrivate) > 0 {
+        appleCert, appleCertErr := certificate.FromPemFile(CfgPP.ApplePushCertPrivate, CfgPP.ApplePushCertPassword)
+        if appleCertErr != nil {
+            LogCritical(fmt.Sprintf("Failed to load the apple pem cert err=%v", appleCertErr))
+        }
 
-	if len(CfgPP.AndroidApiKey) == 0 {
-		LogError("Android push notifications not configured.  Mssing AndroidApiKey.")
-	}
+        if CfgPP.ApplePushUseDevelopment {
+            appleClient = apns.NewClient(appleCert).Development()
+        } else {
+            appleClient = apns.NewClient(appleCert).Production()
+        }
+    } else {
+        LogError("Apple push notifications not configured.  Mssing ApplePushCertPrivate.")
+    }
 
-	router := mux.NewRouter()
-	var handler http.Handler = router
-	vary := throttled.VaryBy{}
-	vary.RemoteAddr = false
-	vary.Headers = strings.Fields(CfgPP.ThrottleVaryByHeader)
-	th := throttled.RateLimit(throttled.PerSec(CfgPP.ThrottlePerSec), &vary, throttledStore.NewMemStore(CfgPP.ThrottleMemoryStoreSize))
+    if len(CfgPP.AndroidApiKey) == 0 {
+        LogError("Android push notifications not configured.  Mssing AndroidApiKey.")
+    }
 
-	th.DeniedHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		LogError(fmt.Sprintf("%v: code=429 ip=%v", r.URL.Path, GetIpAddress(r)))
-		throttled.DefaultDeniedHandler.ServeHTTP(w, r)
-	})
+    router := mux.NewRouter()
+    var handler http.Handler = router
+    vary := throttled.VaryBy{}
+    vary.RemoteAddr = false
+    vary.Headers = strings.Fields(CfgPP.ThrottleVaryByHeader)
+    th := throttled.RateLimit(throttled.PerSec(CfgPP.ThrottlePerSec), &vary, throttledStore.NewMemStore(CfgPP.ThrottleMemoryStoreSize))
 
-	handler = th.Throttle(router)
+    th.DeniedHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        LogError(fmt.Sprintf("%v: code=429 ip=%v", r.URL.Path, GetIpAddress(r)))
+        throttled.DefaultDeniedHandler.ServeHTTP(w, r)
+    })
 
-	router.HandleFunc("/", root).Methods("GET")
+    handler = th.Throttle(router)
 
-	r := router.PathPrefix("/api/v1").Subrouter()
-	r.HandleFunc("/send_push", handleSendNotification).Methods("POST")
+    router.HandleFunc("/", root).Methods("GET")
 
-	go func() {
-		err := manners.ListenAndServe(CfgPP.ListenAddress, handler)
-		if err != nil {
-			LogCritical(err.Error())
-		}
-	}()
+    r := router.PathPrefix("/api/v1").Subrouter()
+    r.HandleFunc("/send_push", handleSendNotification).Methods("POST")
 
-	LogInfo("Server is listening on " + CfgPP.ListenAddress)
+    go func() {
+        err := manners.ListenAndServe(CfgPP.ListenAddress, handler)
+        if err != nil {
+            LogCritical(err.Error())
+        }
+    }()
+
+    LogInfo("Server is listening on " + CfgPP.ListenAddress)
 }
 
 func Stop() {
-	LogInfo("Stopping Server...")
-	manners.Close()
+    LogInfo("Stopping Server...")
+    manners.Close()
 }
 
 func root(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("<html><body>Mattermost Push Proxy</body></html>"))
+    w.Write([]byte("<html><body>Mattermost Push Proxy</body></html>"))
 }
 
 func handleSendNotification(w http.ResponseWriter, r *http.Request) {
-	msg := PushNotificationFromJson(r.Body)
+    msg := PushNotificationFromJson(r.Body)
 
-	if msg == nil {
-		LogError("Failed to read message body")
-	}
+    if msg == nil {
+        LogError("Failed to read message body")
+    }
 
-	if len(msg.ServerId) == 0 {
-		LogError("Failed because of missing server Id")
-	}
+    if len(msg.ServerId) == 0 {
+        LogError("Failed because of missing server Id")
+    }
 
-	if len(msg.Message) > 2047 {
-		msg.Message = msg.Message[0:2046]
-	}
+    if len(msg.Message) > 2047 {
+        msg.Message = msg.Message[0:2046]
+    }
 
-	if msg.Platform == PUSH_NOTIFY_APPLE {
-		go sendAppleNotification(msg)
-	} else if msg.Platform == PUSH_NOTIFY_ANDROID {
-		go sendAndroidNotification(msg)
-	} else {
-		LogError("Missing platform property")
-	}
+    if msg.Platform == PUSH_NOTIFY_APPLE {
+        go sendAppleNotification(msg)
+    } else if msg.Platform == PUSH_NOTIFY_ANDROID {
+        go sendAndroidNotification(msg)
+    } else {
+        LogError("Missing platform property")
+    }
 }
 
 func sendAndroidNotification(msg *PushNotification) {
-	var data map[string]interface{}
-	if msg.Type == PUSH_TYPE_CLEAR {
-		data = map[string]interface{}{"type": PUSH_TYPE_CLEAR, "channel_id": msg.ChannelId, "team_id": msg.TeamId}
-	} else {
-		data = map[string]interface{}{"type": PUSH_TYPE_MESSAGE, "message": emoji.Sprint(msg.Message), "channel_id": msg.ChannelId, "channel_name": msg.ChannelName, "team_id": msg.TeamId}
-	}
+    var data map[string]interface{}
+    if msg.Type == PUSH_TYPE_CLEAR {
+        data = map[string]interface{}{"type": PUSH_TYPE_CLEAR, "channel_id": msg.ChannelId, "team_id": msg.TeamId}
+    } else {
+        data = map[string]interface{}{"type": PUSH_TYPE_MESSAGE, "message": emoji.Sprint(msg.Message), "channel_id": msg.ChannelId, "channel_name": msg.ChannelName, "team_id": msg.TeamId}
+    }
 
-	regIDs := []string{msg.DeviceId}
-	gcmMsg := gcm.NewMessage(data, regIDs...)
+    regIDs := []string{msg.DeviceId}
+    gcmMsg := gcm.NewMessage(data, regIDs...)
 
-	sender := &gcm.Sender{ApiKey: CfgPP.AndroidApiKey}
+    sender := &gcm.Sender{ApiKey: CfgPP.AndroidApiKey}
 
-	if len(CfgPP.AndroidApiKey) > 0 {
-		LogInfo("Sending android push notification")
-		resp, err := sender.Send(gcmMsg, 2)
+    if len(CfgPP.AndroidApiKey) > 0 {
+        LogInfo("Sending android push notification")
+        resp, err := sender.Send(gcmMsg, 2)
 
-		if err != nil {
-			LogError(fmt.Sprintf("Failed to send GCM push sid=%v did=%v err=%v", msg.ServerId, msg.DeviceId, err))
-			return
-		}
+        if err != nil {
+            LogError(fmt.Sprintf("Failed to send GCM push sid=%v did=%v err=%v", msg.ServerId, msg.DeviceId, err))
+            return
+        }
 
-		if resp.Failure > 0 {
-			LogError(fmt.Sprintf("Android response failure: %v", resp))
-		}
-	}
+        if resp.Failure > 0 {
+            LogError(fmt.Sprintf("Android response failure: %v", resp))
+        }
+    }
 }
 
 func sendAppleNotification(msg *PushNotification) {
 
-	notification := &apns.Notification{}
-	notification.DeviceToken = msg.DeviceId
-	payload := payload.NewPayload()
-	notification.Payload = payload
-	notification.Topic = CfgPP.ApplePushTopic
-	payload.Badge(msg.Badge)
+    notification := &apns.Notification{}
+    notification.DeviceToken = msg.DeviceId
+    payload := payload.NewPayload()
+    notification.Payload = payload
+    notification.Topic = CfgPP.ApplePushTopic
+    payload.Badge(msg.Badge)
 
-	if msg.Type != PUSH_TYPE_CLEAR {
-		payload.Alert(emoji.Sprint(msg.Message))
-		payload.Category(msg.Category)
-		payload.Sound("default")
-	}
+    if msg.Type != PUSH_TYPE_CLEAR {
+        payload.Alert(emoji.Sprint(msg.Message))
+        payload.Category(msg.Category)
+        payload.Sound("default")
+    }
 
-	if len(msg.ChannelId) > 0 {
-		payload.Custom("channel_id", msg.ChannelId)
-	}
+    if len(msg.ChannelId) > 0 {
+        payload.Custom("channel_id", msg.ChannelId)
+    }
 
-	if len(msg.TeamId) > 0 {
-		payload.Custom("team_id", msg.TeamId)
-	}
+    if len(msg.TeamId) > 0 {
+        payload.Custom("team_id", msg.TeamId)
+    }
 
-	if len(msg.ChannelName) > 0 {
-		payload.Custom("channel_name", msg.ChannelName)
-	}
+    if len(msg.ChannelName) > 0 {
+        payload.Custom("channel_name", msg.ChannelName)
+    }
 
-	if appleClient != nil {
-		LogInfo("Sending apple push notification")
-		res, err := appleClient.Push(notification)
-		if err != nil {
-			LogError(fmt.Sprintf("Failed to send apple push sid=%v did=%v err=%v", msg.ServerId, msg.DeviceId, err))
-		}
-
-		if !res.Sent() {
-			LogError(fmt.Sprintf("Failed to send apple push with res ApnsID=%v reason=%v code=%v", res.ApnsID, res.Reason, res.StatusCode))
-		}
-	}
+    if appleClient != nil {
+        LogInfo("Sending apple push notification")
+        res, err := appleClient.Push(notification)
+        if err != nil {
+            LogError(fmt.Sprintf("Failed to send apple push sid=%v did=%v err=%v", msg.ServerId, msg.DeviceId, err))
+        } else if !res.Sent() {
+            LogError(fmt.Sprintf("Failed to send apple push with res ApnsID=%v reason=%v code=%v", res.ApnsID, res.Reason, res.StatusCode))
+        }
+    }
 }
 
 func LogInfo(msg string) {
-	Log("INFO", msg)
+    Log("INFO", msg)
 }
 
 func LogError(msg string) {
-	Log("ERROR", msg)
+    Log("ERROR", msg)
 }
 
 func LogCritical(msg string) {
-	Log("CRIT", msg)
-	panic(msg)
+    Log("CRIT", msg)
+    panic(msg)
 }
 
 func Log(level string, msg string) {
-	log.Printf("%v %v\n", level, msg)
+    log.Printf("%v %v\n", level, msg)
 }
 
 func GetIpAddress(r *http.Request) string {
-	address := r.Header.Get(HEADER_FORWARDED)
+    address := r.Header.Get(HEADER_FORWARDED)
 
-	if len(address) == 0 {
-		address = r.Header.Get(HEADER_REAL_IP)
-	}
+    if len(address) == 0 {
+        address = r.Header.Get(HEADER_REAL_IP)
+    }
 
-	if len(address) == 0 {
-		address, _, _ = net.SplitHostPort(r.RemoteAddr)
-	}
+    if len(address) == 0 {
+        address, _, _ = net.SplitHostPort(r.RemoteAddr)
+    }
 
-	return address
+    return address
 }
